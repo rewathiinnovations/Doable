@@ -1,0 +1,253 @@
+# ==============================================================================
+# Doable — Coolify compose (source build, Traefik in front of in-stack Caddy)
+# ==============================================================================
+# Same service topology as docker-compose.yml (builds from source), adapted
+# for Coolify (https://coolify.io):
+#
+#   - Coolify's Traefik owns host ports 80/443 and terminates TLS. Caddy
+#     therefore publishes NO host ports; it listens on plain HTTP :80 inside
+#     the stack and keeps its job as the single path router
+#     (/api/* -> api, /ws -> ws, /auth/* -> api, /sites/* static, rest -> web).
+#   - Assign the public domain to the `caddy` service in Coolify
+#     (e.g. https://doable.example.com:80). Do NOT give api/ws/web a domain.
+#   - Coolify settings for this app:
+#       Build Pack ............ Docker Compose
+#       Base Directory ........ /deployment/docker
+#       Compose Location ...... /docker-compose.coolify.yml
+#       Preserve Repository ... ON  (so ./init.sql, ./02-roles.sh and
+#                                    ./Caddyfile bind mounts exist on the host)
+#   - The prebuilt ghcr.io/doable-me/doable-* images are not public, so this
+#     file builds the four targets from deployment/docker/Dockerfile. They
+#     share the `deps`/`build` stages, so it is effectively one build.
+#   - NEXT_PUBLIC_* are RUNTIME here: the web image is built with placeholder
+#     URLs and web-runtime-entrypoint.sh substitutes them on container start.
+#
+# Required env (set in Coolify -> Environment Variables):
+#   POSTGRES_PASSWORD, DOABLE_APP_PASSWORD, JWT_SECRET, ENCRYPTION_KEY,
+#   INTERNAL_SECRET, DOABLE_KEK, CORS_ORIGINS,
+#   NEXT_PUBLIC_API_URL, NEXT_PUBLIC_WS_URL, NEXT_PUBLIC_APP_URL
+# Optional: INSTALL_BOOTSTRAP_TOKEN(+_EXPIRES_AT), AI provider keys, OAuth,
+#   PUBLISH_MODE, RATE_LIMIT_DISABLED, DOABLE_* tunables (see docker-compose.yml).
+# ==============================================================================
+
+services:
+  # --- PostgreSQL with pgvector ---
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-doable}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-doable}
+      # Password for the runtime-only doable_app role (see 02-roles.sh).
+      DOABLE_APP_PASSWORD: ${DOABLE_APP_PASSWORD:?DOABLE_APP_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./02-roles.sh:/docker-entrypoint-initdb.d/02-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-doable}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+
+  # --- Run database migrations (one-shot) ---
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile
+      target: migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Owner role — DDL only happens here. Runtime api+ws use doable_app.
+      DATABASE_URL: postgres://${POSTGRES_USER:-doable}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-doable}
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # --- API server (Hono) ---
+  api:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile
+      target: api
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://doable_app:${DOABLE_APP_PASSWORD:?DOABLE_APP_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-doable}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-20}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      JWT_ISSUER: ${JWT_ISSUER:-doable}
+      JWT_ACCESS_TOKEN_EXPIRES_IN: ${JWT_ACCESS_TOKEN_EXPIRES_IN:-15m}
+      JWT_REFRESH_TOKEN_EXPIRES_IN: ${JWT_REFRESH_TOKEN_EXPIRES_IN:-7d}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      DOABLE_KEK: ${DOABLE_KEK:?DOABLE_KEK is required}
+      API_PORT: 4000
+      API_HOST: 0.0.0.0
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required, e.g. "https://doable.example.com"}
+      WS_PORT: 4001
+      WS_HOST: 0.0.0.0
+      INTERNAL_SECRET: ${INTERNAL_SECRET:?INTERNAL_SECRET is required}
+      WS_INTERNAL_URL: http://ws:4001
+      API_URL: http://api:4000
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL is required, e.g. https://doable.example.com/api}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:?NEXT_PUBLIC_WS_URL is required, e.g. wss://doable.example.com/ws}
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:?NEXT_PUBLIC_APP_URL is required, e.g. https://doable.example.com}
+      NODE_ENV: ${NODE_ENV:-production}
+      PROJECTS_ROOT: ./projects
+      SITES_DIR: /data/sites
+      PUBLISH_BASE_URL: ${PUBLISH_BASE_URL:-${NEXT_PUBLIC_APP_URL}}
+      PUBLISH_MODE: ${PUBLISH_MODE:-}
+      DOABLE_APP_DB_ENABLED: ${DOABLE_APP_DB_ENABLED:-1}
+      DOABLE_APP_DB_MEMORY_MB: ${DOABLE_APP_DB_MEMORY_MB:-128}
+      DOABLE_APP_DB_MAX_WORKERS: ${DOABLE_APP_DB_MAX_WORKERS:-32}
+      DOABLE_APP_DB_QUERY_TIMEOUT_MS: ${DOABLE_APP_DB_QUERY_TIMEOUT_MS:-5000}
+      DOABLE_APP_DB_IDLE_MS: ${DOABLE_APP_DB_IDLE_MS:-600000}
+      DOABLE_APP_AI_ENABLED: ${DOABLE_APP_AI_ENABLED:-1}
+      INSTALL_BOOTSTRAP_TOKEN: ${INSTALL_BOOTSTRAP_TOKEN:-}
+      INSTALL_BOOTSTRAP_TOKEN_EXPIRES_AT: ${INSTALL_BOOTSTRAP_TOKEN_EXPIRES_AT:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GITHUB_REDIRECT_URI: ${GITHUB_REDIRECT_URI:-}
+      GITHUB_COPILOT_REDIRECT_URI: ${GITHUB_COPILOT_REDIRECT_URI:-}
+      GITHUB_REPO_REDIRECT_URI: ${GITHUB_REPO_REDIRECT_URI:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
+      RATE_LIMIT_DISABLED: ${RATE_LIMIT_DISABLED:-}
+      DOABLE_HARDENING: ${DOABLE_HARDENING:-off}
+      DOABLE_HARDENING_LEVEL: ${DOABLE_HARDENING_LEVEL:-off}
+      DOABLE_SANDBOX_INSTALL: ${DOABLE_SANDBOX_INSTALL:-0}
+    volumes:
+      - api_projects:/app/services/api/projects
+      - api_thumbnails:/app/services/api/thumbnails
+      - doable_sites:/data/sites
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # --- WebSocket server (Yjs CRDT) ---
+  ws:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile
+      target: ws
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://doable_app:${DOABLE_APP_PASSWORD:?DOABLE_APP_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-doable}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      WS_PORT: 4001
+      WS_HOST: 0.0.0.0
+      INTERNAL_SECRET: ${INTERNAL_SECRET:?INTERNAL_SECRET is required}
+      API_URL: http://api:4000
+      NODE_ENV: ${NODE_ENV:-production}
+      WS_ALLOWED_ORIGINS: ${WS_ALLOWED_ORIGINS:-${CORS_ORIGINS}}
+      DOABLE_KEK: ${DOABLE_KEK:?DOABLE_KEK is required}
+      DOABLE_PROJECTS_DIR: /app/services/ws/projects
+    volumes:
+      - ws_projects:/app/services/ws/projects
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # --- Web frontend (Next.js) ---
+  web:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile
+      target: web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+      ws:
+        condition: service_healthy
+    environment:
+      # Server-side only: Next.js middleware reaches api over the stack network.
+      API_INTERNAL_URL: http://api:4000
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL is required}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:?NEXT_PUBLIC_WS_URL is required}
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:?NEXT_PUBLIC_APP_URL is required}
+      HOSTNAME: 0.0.0.0
+      PORT: 3000
+      NODE_ENV: ${NODE_ENV:-production}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # --- Caddy path router (plain HTTP behind Coolify's Traefik) ---
+  # Traefik -> caddy:80 -> {api,ws,web}. Same Caddyfile as the standalone
+  # install; DOABLE_SITE=":80" makes Caddy an HTTP-only listener, so no ACME
+  # and no HTTPS redirect (Traefik already handles both).
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    expose:
+      - "80"
+    environment:
+      DOABLE_SITE: ":80"
+      DOABLE_TLS: internal
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - doable_sites:/srv/sites:ro
+    depends_on:
+      api:
+        condition: service_healthy
+      ws:
+        condition: service_healthy
+      web:
+        condition: service_started
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+volumes:
+  postgres_data:
+  api_projects:
+  api_thumbnails:
+  ws_projects:
+  caddy_data:
+  caddy_config:
+  doable_sites:

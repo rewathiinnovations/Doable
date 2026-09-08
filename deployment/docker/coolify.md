@@ -5,6 +5,25 @@ Coolify is a self-hosted PaaS that runs on Docker + Traefik on a single VPS
 new manifest file for Coolify — this guide describes the connect flow against
 the prebuilt `deployment/docker/docker-compose.prod.yml` (pulls from `ghcr.io/doable-me/doable-*`).
 
+> **This fork (rewathiinnovations/Doable): use `docker-compose.coolify.yml`.**
+> The `ghcr.io/doable-me/doable-*` images are not publicly pullable, and the
+> prod compose's Caddy publishes host ports 80/443 that Coolify's Traefik
+> already owns. `deployment/docker/docker-compose.coolify.yml` builds from
+> source and runs Caddy as an HTTP-only path router behind Traefik.
+> Coolify settings that differ from the flow below:
+>
+> | Setting | Value |
+> | --- | --- |
+> | Repository / branch | `https://github.com/rewathiinnovations/Doable`, `deploy/coolify` |
+> | Base Directory | `/deployment/docker` |
+> | Docker Compose Location | `/docker-compose.coolify.yml` |
+> | Preserve Repository During Deployment | **on** (bind mounts `./init.sql`, `./02-roles.sh`, `./Caddyfile`) |
+> | Domain | on the **`caddy`** service only, e.g. `https://doable.example.com:80` |
+>
+> Additional required env: `DOABLE_APP_PASSWORD` (runtime `doable_app` DB role).
+> `NEXT_PUBLIC_*` are **runtime** vars here (placeholder substitution at
+> container start), so changing the domain needs a restart, not a rebuild.
+
 
 ## Prerequisites
 
