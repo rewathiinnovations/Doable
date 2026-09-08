@@ -23,6 +23,9 @@ the prebuilt `deployment/docker/docker-compose.prod.yml` (pulls from `ghcr.io/do
 > Additional required env: `DOABLE_APP_PASSWORD` (runtime `doable_app` DB role).
 > `NEXT_PUBLIC_*` are **runtime** vars here (placeholder substitution at
 > container start), so changing the domain needs a restart, not a rebuild.
+> Do **not** set `NODE_ENV` as a Coolify env var and keep "Inject build args
+> into Dockerfile" off: otherwise `pnpm install` skips devDependencies and
+> `next build` fails. First user signs up at `/signup` (not `/auth/register`).
 
 
 ## Prerequisites
